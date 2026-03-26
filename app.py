@@ -449,6 +449,7 @@ def fmt_time(seconds: float) -> str:
 # ──────────────────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("### ⚙️ إعدادات المحرك")
+    st.caption("📦 إصدار 2.1 · Mistral + Alibaba Qwen-VL-OCR")
 
     engine = st.selectbox(
         "محرك OCR",
@@ -588,6 +589,10 @@ with col_guide:
 with col_main:
     # ── Engine indicator ───────────────────────────────────────────────────────
     st.markdown(f'<div class="info-box">🔧 المحرك الحالي: <strong>{engine_label}</strong></div>', unsafe_allow_html=True)
+    st.caption(
+        "📱 على الجوال: اضغط أيقونة **☰** أعلى اليسار لفتح الشريط الجانبي، ثم اختر المحرك "
+        "**Alibaba Qwen-VL-OCR** من القائمة. إن لم يظهر التحديث: امسح بيانات الموقع من المتصفح أو جرّب وضع التصفح الخاص."
+    )
     st.markdown("<hr>", unsafe_allow_html=True)
 
     # ── File Upload ────────────────────────────────────────────────────────────
