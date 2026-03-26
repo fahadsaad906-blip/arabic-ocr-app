@@ -6,9 +6,11 @@ import json
 import time
 import io
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import fitz  # PyMuPDF
 from mistralai.client import Mistral
+from openai import OpenAI
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Config file — saves API key + theme locally
@@ -36,10 +38,10 @@ def save_config(data: dict) -> None:
 # Page Configuration
 # ──────────────────────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Arabic PDF OCR — Mistral OCR",
+    page_title="Arabic PDF OCR — Multi-Engine",
     page_icon="📜",
     layout="wide",
-    initial_sidebar_state="collapsed",
+    initial_sidebar_state="expanded",
 )
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -48,6 +50,12 @@ st.set_page_config(
 cfg = load_config()
 if "saved_key" not in st.session_state:
     st.session_state.saved_key = cfg.get("api_key", "")
+if "alibaba_key" not in st.session_state:
+    st.session_state.alibaba_key = cfg.get("alibaba_api_key", "")
+if "alibaba_region" not in st.session_state:
+    st.session_state.alibaba_region = cfg.get("alibaba_region", "دولي (سنغافورة)")
+if "ocr_engine" not in st.session_state:
+    st.session_state.ocr_engine = cfg.get("ocr_engine", "Mistral OCR")
 if "result_pages" not in st.session_state:
     st.session_state.result_pages = []
 if "result_all_pages" not in st.session_state:
@@ -245,6 +253,113 @@ def run_mistral_ocr(pdf_bytes: bytes, api_key: str) -> list[str]:
     return pages_text
 
 
+ALIBABA_SYSTEM_PROMPT = (
+    "You are an expert in Arabic OCR. Extract the Arabic text from the image "
+    "with high accuracy, maintaining the original line breaks and paragraph "
+    "formatting. Do not output any introductions or explanations, just return "
+    "the extracted text."
+)
+
+
+MAX_DATA_URI_BYTES = 10_000_000
+TARGET_OCR_DPI = 250
+MAX_PAGE_EDGE_PX = 3000
+
+
+def _initial_dpi_for_page(page) -> int:
+    """Pick DPI once from page size so we avoid multiple expensive full renders.
+
+    Large PDF pages at 250 DPI produce huge pixmaps (slow + often >10MB base64).
+    Capping the longest edge in pixels keeps OCR sharp on normal pages and
+    speeds giant pages dramatically.
+    """
+    rect = page.rect
+    long_pt = max(rect.width, rect.height)
+    if long_pt <= 1:
+        return TARGET_OCR_DPI
+    px_at_target = long_pt * TARGET_OCR_DPI / 72.0
+    if px_at_target <= MAX_PAGE_EDGE_PX:
+        return TARGET_OCR_DPI
+    dpi = int(72.0 * MAX_PAGE_EDGE_PX / long_pt)
+    return max(dpi, 100)
+
+
+def _page_to_jpeg_b64(page) -> str:
+    dpi = _initial_dpi_for_page(page)
+    b64 = ""
+    while dpi >= 72:
+        pix = page.get_pixmap(dpi=dpi, alpha=False)
+        img_bytes = pix.tobytes("jpeg", jpg_quality=95)
+        b64 = base64.b64encode(img_bytes).decode("utf-8")
+        if len(b64) <= MAX_DATA_URI_BYTES:
+            return b64
+        dpi = int(dpi * 0.82)
+    return b64
+
+
+def pdf_pages_to_base64(pdf_bytes: bytes, progress_callback=None) -> list[str]:
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    total = len(doc)
+    images_b64: list[str] = []
+    for idx, page in enumerate(doc):
+        images_b64.append(_page_to_jpeg_b64(page))
+        if progress_callback:
+            progress_callback(idx + 1, total)
+    doc.close()
+    return images_b64
+
+
+def _ocr_single_page_alibaba(
+    client: OpenAI, page_idx: int, img_b64: str
+) -> tuple[int, str]:
+    response = client.chat.completions.create(
+        model="qwen-vl-ocr",
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"},
+                    },
+                    {"type": "text", "text": ALIBABA_SYSTEM_PROMPT},
+                ],
+            },
+        ],
+    )
+    raw_text = response.choices[0].message.content or ""
+    cleaned = clean_markdown_artifacts(raw_text)
+    filtered = filter_arabic_content(cleaned)
+    return page_idx, filtered
+
+
+def run_alibaba_ocr(
+    pdf_bytes: bytes, api_key: str, base_url: str,
+    img_progress_callback=None, ocr_progress_callback=None,
+) -> list[str]:
+    client = OpenAI(
+        api_key=api_key,
+        base_url=base_url,
+    )
+    images_b64 = pdf_pages_to_base64(pdf_bytes, img_progress_callback)
+    total = len(images_b64)
+    results: dict[int, str] = {}
+    max_workers = min(10, total)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(_ocr_single_page_alibaba, client, i, img): i
+            for i, img in enumerate(images_b64)
+        }
+        for future in as_completed(futures):
+            page_idx, text = future.result()
+            results[page_idx] = text
+            if ocr_progress_callback:
+                ocr_progress_callback(len(results), total)
+
+    return [results[i] for i in range(total)]
+
+
 def _find_arabic_font() -> Path | None:
     candidates = [
         Path(r"C:\Windows\Fonts\tahoma.ttf"),
@@ -306,14 +421,19 @@ def generate_searchable_pdf(original_bytes: bytes, all_pages_text: list[str]) ->
     return buf.getvalue()
 
 
-def classify_error(exc: Exception) -> str:
+def classify_error(exc: Exception, engine: str = "Mistral OCR") -> str:
     msg = str(exc)
+    if engine == "Mistral OCR":
+        console_link = "[console.mistral.ai](https://console.mistral.ai)"
+    else:
+        console_link = "[dashscope.console.aliyun.com](https://dashscope.console.aliyun.com)"
+
     if "401" in msg or "Unauthorized" in msg or "invalid" in msg.lower():
-        return "**مفتاح API غير صحيح أو منتهي.**  تحقق منه على [console.mistral.ai](https://console.mistral.ai)."
+        return f"**مفتاح API غير صحيح أو منتهي.**  تحقق منه على {console_link}."
     if "429" in msg or "rate limit" in msg.lower():
         return "**تم تجاوز الحد المسموح به.**  انتظر دقيقة ثم حاول مجدداً."
     if "quota" in msg.lower() or "insufficient" in msg.lower() or "payment" in msg.lower():
-        return "**رصيد الحساب نفد.**  يرجى إعادة الشحن على [console.mistral.ai](https://console.mistral.ai)."
+        return f"**رصيد الحساب نفد.**  يرجى إعادة الشحن على {console_link}."
     if "413" in msg or "too large" in msg.lower():
         return "**الملف كبير جداً.**  جرّب ملف أصغر أو قسّمه لأجزاء."
     return f"**خطأ من API.**  \n`{msg[:300]}`"
@@ -325,21 +445,99 @@ def fmt_time(seconds: float) -> str:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Hero + Theme Toggle
+# Sidebar — Engine Selection & API Keys
 # ──────────────────────────────────────────────────────────────────────────────
-theme_col1, theme_col2 = st.columns([6, 1])
-with theme_col2:
-    theme_label = "☀️ نهاري" if st.session_state.dark_mode else "🌙 ليلي"
+with st.sidebar:
+    st.markdown("### ⚙️ إعدادات المحرك")
+
+    engine = st.selectbox(
+        "محرك OCR",
+        options=["Mistral OCR", "Alibaba Qwen-VL-OCR"],
+        index=["Mistral OCR", "Alibaba Qwen-VL-OCR"].index(st.session_state.ocr_engine),
+        key="engine_select",
+    )
+    if engine != st.session_state.ocr_engine:
+        st.session_state.ocr_engine = engine
+        save_config({"ocr_engine": engine})
+
+    st.markdown("---")
+
+    if engine == "Mistral OCR":
+        st.markdown("##### 🔑 Mistral API Key")
+        mistral_key_input = st.text_input(
+            label="Mistral API Key", type="password",
+            placeholder="الصق مفتاح Mistral هنا…",
+            value=st.session_state.saved_key,
+            help="احصل على المفتاح من console.mistral.ai",
+            label_visibility="collapsed",
+            key="sidebar_mistral_key",
+        )
+        if mistral_key_input != st.session_state.saved_key:
+            st.session_state.saved_key = mistral_key_input
+            save_config({"api_key": mistral_key_input})
+        active_api_key = mistral_key_input
+    else:
+        st.markdown("##### 🔑 Alibaba API Key")
+        alibaba_key_input = st.text_input(
+            label="Alibaba API Key", type="password",
+            placeholder="الصق مفتاح Alibaba هنا…",
+            value=st.session_state.alibaba_key,
+            help="احصل على المفتاح من dashscope.console.aliyun.com",
+            label_visibility="collapsed",
+            key="sidebar_alibaba_key",
+        )
+        if alibaba_key_input != st.session_state.alibaba_key:
+            st.session_state.alibaba_key = alibaba_key_input
+            save_config({"alibaba_api_key": alibaba_key_input})
+        active_api_key = alibaba_key_input
+
+        st.markdown("##### 🌍 منطقة الخادم")
+        alibaba_regions = {
+            "دولي (سنغافورة)": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+            "الصين (بكين)": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            "عالمي (أمريكا)": "https://dashscope-us.aliyuncs.com/compatible-mode/v1",
+        }
+        saved_region = st.session_state.get("alibaba_region", "دولي (سنغافورة)")
+        selected_region = st.selectbox(
+            "اختر المنطقة",
+            options=list(alibaba_regions.keys()),
+            index=list(alibaba_regions.keys()).index(saved_region) if saved_region in alibaba_regions else 0,
+            key="region_select",
+        )
+        if selected_region != st.session_state.get("alibaba_region"):
+            st.session_state.alibaba_region = selected_region
+            save_config({"alibaba_region": selected_region})
+
+    if active_api_key:
+        masked = active_api_key[:5] + "●" * 8 + active_api_key[-4:] if len(active_api_key) > 9 else "●" * len(active_api_key)
+        st.success(f"المفتاح: `{masked}`")
+    else:
+        st.info("🔒 أدخل مفتاح API للبدء.")
+
+    st.markdown("---")
+    theme_label = "☀️ التبديل للوضع النهاري" if st.session_state.dark_mode else "🌙 التبديل للوضع الليلي"
     if st.button(theme_label, key="theme_toggle", use_container_width=True):
         st.session_state.dark_mode = not st.session_state.dark_mode
         save_config({"dark_mode": st.session_state.dark_mode})
         st.rerun()
 
-st.markdown("""
+engine_label = st.session_state.ocr_engine
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Hero
+# ──────────────────────────────────────────────────────────────────────────────
+if engine_label == "Mistral OCR":
+    hero_badge = "⚡ Mistral OCR · طلب واحد للملف كاملاً · دقة عالية"
+    hero_desc = "ارفع ملف PDF — يُعالج الملف كاملاً في طلب واحد بتقنية Mistral OCR"
+else:
+    hero_badge = "⚡ Alibaba Qwen-VL-OCR · معالجة متوازية · دقة عالية"
+    hero_desc = "ارفع ملف PDF — يُعالج كل صفحة بشكل متوازٍ بتقنية Qwen-VL-OCR"
+
+st.markdown(f"""
 <div class="hero">
-    <div class="hero-badge">⚡ Mistral OCR · طلب واحد للملف كاملاً · دقة عالية</div>
+    <div class="hero-badge">{hero_badge}</div>
     <h1>📜 مستخرج النصوص العربية من PDF</h1>
-    <p>ارفع ملف PDF — يُعالج الملف كاملاً في طلب واحد بتقنية Mistral OCR</p>
+    <p>{hero_desc}</p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -349,47 +547,47 @@ st.markdown("""
 col_main, col_guide = st.columns([3, 1], gap="large")
 
 with col_guide:
-    st.markdown(f"""
-<div class="card">
-    <div class="section-label">📋 كيفية الاستخدام</div>
-    <div class="step"><div class="step-num">1</div><div class="step-text">الصق <strong>مفتاح Mistral AI</strong> — يُحفظ تلقائياً.</div></div>
-    <div class="step"><div class="step-num">2</div><div class="step-text">ارفع ملف <strong>PDF</strong> العربي.</div></div>
-    <div class="step"><div class="step-num">3</div><div class="step-text">اضغط <strong>ابدأ الاستخراج</strong> وانتظر.</div></div>
-    <div class="step"><div class="step-num">4</div><div class="step-text">حمّل النتيجة بصيغة <strong>TXT أو MD أو PDF</strong>.</div></div>
-</div>
-<div class="card">
-    <div class="section-label">⚡ المميزات</div>
-    <p style="font-size:.82rem;color:{TEXT_SUB};line-height:1.9;margin:0;">
+    key_step = (
+        f"الصق <strong>مفتاح {engine_label}</strong> في الشريط الجانبي."
+    )
+    if engine_label == "Mistral OCR":
+        features_html = f"""
         • يُرسل الملف كاملاً في <strong>طلب واحد</strong>.<br>
         • نموذج OCR متخصص بدقة عالية.<br>
         • يحافظ على بنية المستند.<br>
         • تحميل بـ 3 صيغ: TXT, MD, PDF.<br>
         • ثيم ليلي / نهاري.<br>
         • مفتاح من <a href="https://console.mistral.ai" target="_blank" style="color:#7C3AED;">console.mistral.ai</a>
+        """
+    else:
+        features_html = f"""
+        • معالجة <strong>متوازية</strong> لكل الصفحات.<br>
+        • نموذج Qwen-VL-OCR بدقة عالية.<br>
+        • يحافظ على بنية المستند.<br>
+        • تحميل بـ 3 صيغ: TXT, MD, PDF.<br>
+        • ثيم ليلي / نهاري.<br>
+        • مفتاح من <a href="https://dashscope.console.aliyun.com" target="_blank" style="color:#7C3AED;">dashscope.console.aliyun.com</a>
+        """
+
+    st.markdown(f"""
+<div class="card">
+    <div class="section-label">📋 كيفية الاستخدام</div>
+    <div class="step"><div class="step-num">1</div><div class="step-text">{key_step}</div></div>
+    <div class="step"><div class="step-num">2</div><div class="step-text">ارفع ملف <strong>PDF</strong> العربي.</div></div>
+    <div class="step"><div class="step-num">3</div><div class="step-text">اضغط <strong>ابدأ الاستخراج</strong> وانتظر.</div></div>
+    <div class="step"><div class="step-num">4</div><div class="step-text">حمّل النتيجة بصيغة <strong>TXT أو MD أو PDF</strong>.</div></div>
+</div>
+<div class="card">
+    <div class="section-label">⚡ المميزات — {engine_label}</div>
+    <p style="font-size:.82rem;color:{TEXT_SUB};line-height:1.9;margin:0;">
+        {features_html}
     </p>
 </div>
 """, unsafe_allow_html=True)
 
 with col_main:
-    # ── API Key ────────────────────────────────────────────────────────────────
-    st.markdown('<div class="section-label">🔑 مفتاح Mistral AI API</div>', unsafe_allow_html=True)
-    api_key_input = st.text_input(
-        label="api_key", type="password",
-        placeholder="الصق مفتاحك هنا…",
-        value=st.session_state.saved_key,
-        help="يُحفظ تلقائياً.", label_visibility="collapsed",
-    )
-    if api_key_input and api_key_input != st.session_state.saved_key:
-        save_config({"api_key": api_key_input})
-        st.session_state.saved_key = api_key_input
-
-    if api_key_input:
-        masked = api_key_input[:5] + "●" * 8 + api_key_input[-4:] if len(api_key_input) > 9 else "●" * len(api_key_input)
-        tag = " · <strong>محفوظ ✅</strong>" if CONFIG_FILE.exists() else ""
-        st.markdown(f'<div class="info-box">🔑 المفتاح: <code>{masked}</code>{tag}</div>', unsafe_allow_html=True)
-    else:
-        st.markdown('<div class="info-box">🔒 المفتاح يُحفظ محلياً فقط.</div>', unsafe_allow_html=True)
-
+    # ── Engine indicator ───────────────────────────────────────────────────────
+    st.markdown(f'<div class="info-box">🔧 المحرك الحالي: <strong>{engine_label}</strong></div>', unsafe_allow_html=True)
     st.markdown("<hr>", unsafe_allow_html=True)
 
     # ── File Upload ────────────────────────────────────────────────────────────
@@ -406,8 +604,8 @@ with col_main:
     start = st.button("🚀  ابدأ الاستخراج", use_container_width=True)
 
     if start:
-        if not api_key_input:
-            st.error("❌ **مفتاح API مفقود.**"); st.stop()
+        if not active_api_key:
+            st.error("❌ **مفتاح API مفقود.** أدخل المفتاح في الشريط الجانبي."); st.stop()
         if uploaded_file is None:
             st.error("❌ **لم يتم رفع ملف.**"); st.stop()
 
@@ -426,13 +624,17 @@ with col_main:
         with c2:
             st.markdown(f'<div class="stat-box"><div class="stat-value">{fsize_mb:.1f} MB</div><div class="stat-label">حجم الملف</div></div>', unsafe_allow_html=True)
         with c3:
-            st.markdown('<div class="stat-box"><div class="stat-value">1</div><div class="stat-label">طلب API واحد</div></div>', unsafe_allow_html=True)
+            engine_stat = "1 طلب" if engine_label == "Mistral OCR" else "متوازي"
+            st.markdown(f'<div class="stat-box"><div class="stat-value">{engine_stat}</div><div class="stat-label">نمط المعالجة</div></div>', unsafe_allow_html=True)
 
         st.markdown("<br>", unsafe_allow_html=True)
+        progress_bar = st.progress(0)
         live_panel = st.empty()
         start_t = time.time()
 
-        live_panel.markdown(f"""
+        if engine_label == "Mistral OCR":
+            # ── Mistral path (unchanged core logic) ────────────────────────────
+            live_panel.markdown(f"""
 <div class="progress-panel">
     <div class="progress-row">
         <div class="progress-item"><div class="progress-big">{total_pages}</div><div class="progress-tiny">صفحة</div></div>
@@ -441,13 +643,74 @@ with col_main:
     <div class="status-msg">⚙️ جار إرسال الملف كاملاً إلى Mistral OCR — يرجى الانتظار…</div>
 </div>
 """, unsafe_allow_html=True)
+            progress_bar.progress(10)
 
-        try:
-            pages_text = run_mistral_ocr(pdf_bytes, api_key_input)
-        except Exception as exc:
-            live_panel.empty()
-            st.error(f"❌ {classify_error(exc)}")
-            st.stop()
+            try:
+                pages_text = run_mistral_ocr(pdf_bytes, active_api_key)
+            except Exception as exc:
+                live_panel.empty()
+                progress_bar.empty()
+                st.error(f"❌ {classify_error(exc, engine_label)}")
+                st.stop()
+
+            progress_bar.progress(100)
+
+        else:
+            # ── Alibaba Qwen-VL-OCR path (parallel) ───────────────────────────
+
+            def _img_progress(done: int, total: int):
+                pct = int(done / total * 50) if total else 50
+                progress_bar.progress(pct)
+                elapsed = time.time() - start_t
+                live_panel.markdown(f"""
+<div class="progress-panel">
+    <div class="progress-row">
+        <div class="progress-item"><div class="progress-big">{done} / {total}</div><div class="progress-tiny">تجهيز الصور</div></div>
+        <div class="progress-item"><div class="progress-big">⏱ {fmt_time(elapsed)}</div><div class="progress-tiny">الوقت المنقضي</div></div>
+    </div>
+    <div class="status-msg">📄 المرحلة 1/2: جار تحويل صفحات PDF إلى صور…</div>
+</div>
+""", unsafe_allow_html=True)
+
+            _img_progress(0, total_pages if isinstance(total_pages, int) else 1)
+
+            def _ocr_progress(done: int, total: int):
+                pct = 50 + int(done / total * 50) if total else 100
+                progress_bar.progress(pct)
+                elapsed = time.time() - start_t
+                live_panel.markdown(f"""
+<div class="progress-panel">
+    <div class="progress-row">
+        <div class="progress-item"><div class="progress-big">{done} / {total}</div><div class="progress-tiny">صفحات مكتملة</div></div>
+        <div class="progress-item"><div class="progress-big">⏱ {fmt_time(elapsed)}</div><div class="progress-tiny">الوقت المنقضي</div></div>
+    </div>
+    <div class="status-msg">⚙️ المرحلة 2/2: جار استخراج النصوص بشكل متوازٍ عبر Qwen-VL-OCR…</div>
+</div>
+""", unsafe_allow_html=True)
+
+            alibaba_regions = {
+                "دولي (سنغافورة)": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+                "الصين (بكين)": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                "عالمي (أمريكا)": "https://dashscope-us.aliyuncs.com/compatible-mode/v1",
+            }
+            region_url = alibaba_regions.get(
+                st.session_state.get("alibaba_region", "دولي (سنغافورة)"),
+                "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+            )
+
+            try:
+                pages_text = run_alibaba_ocr(
+                    pdf_bytes, active_api_key, region_url,
+                    img_progress_callback=_img_progress,
+                    ocr_progress_callback=_ocr_progress,
+                )
+            except Exception as exc:
+                live_panel.empty()
+                progress_bar.empty()
+                st.error(f"❌ {classify_error(exc, engine_label)}")
+                st.stop()
+
+            progress_bar.progress(100)
 
         total_elapsed = time.time() - start_t
         non_empty = [t for t in pages_text if t.strip()]
@@ -458,7 +721,7 @@ with col_main:
         <div class="progress-item"><div class="progress-big" style="color:#059669;">{len(non_empty)} / {len(pages_text)}</div><div class="progress-tiny">صفحات بنص</div></div>
         <div class="progress-item"><div class="progress-big" style="color:#059669;">⏱ {fmt_time(total_elapsed)}</div><div class="progress-tiny">إجمالي الوقت</div></div>
     </div>
-    <div class="status-msg" style="color:#059669;font-weight:600;">✅ اكتمل الاستخراج!</div>
+    <div class="status-msg" style="color:#059669;font-weight:600;">✅ اكتمل الاستخراج عبر {engine_label}!</div>
 </div>
 """, unsafe_allow_html=True)
 

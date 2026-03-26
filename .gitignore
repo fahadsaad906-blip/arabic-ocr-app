@@ -1,4 +1,7 @@
 ocr_config.json
+*.log
 __pycache__/
-*.pyc
+*.py[cod]
+.venv/
+venv/
 .env
