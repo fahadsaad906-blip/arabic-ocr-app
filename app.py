@@ -449,7 +449,7 @@ def fmt_time(seconds: float) -> str:
 # ──────────────────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("### ⚙️ إعدادات المحرك")
-    st.caption("📦 إصدار 2.1 · Mistral + Alibaba Qwen-VL-OCR")
+    st.caption("📦 إصدار 2.2 — نشر 2026-03-27 · Mistral + Alibaba Qwen-VL-OCR")
 
     engine = st.selectbox(
         "محرك OCR",

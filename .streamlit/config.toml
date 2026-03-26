@@ -1,0 +1,6 @@
+# يضمن إعدادات ثابتة بعد كل نشر
+[server]
+headless = true
+
+[browser]
+gatherUsageStats = false
